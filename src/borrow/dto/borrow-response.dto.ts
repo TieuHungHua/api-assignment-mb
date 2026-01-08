@@ -7,7 +7,7 @@ class BorrowUserDto {
   @ApiProperty({ example: 'testuser', description: 'Username' })
   username: string;
 
-  @ApiProperty({ example: 'Test User', description: 'Tên hiển thị' })
+  @ApiProperty({ example: 'Test User ', description: 'Tên hiển thị' })
   displayName: string;
 }
 
@@ -38,15 +38,15 @@ export class BorrowResponseDto {
   @ApiProperty({ example: '2024-01-15T00:00:00.000Z', description: 'Ngày hết hạn' })
   dueAt: Date;
 
-  @ApiProperty({ 
-    example: '2024-01-10T00:00:00.000Z', 
+  @ApiProperty({
+    example: '2024-01-10T00:00:00.000Z',
     description: 'Thời gian trả',
     nullable: true,
   })
   returnedAt: Date | null;
 
-  @ApiProperty({ 
-    example: 'active', 
+  @ApiProperty({
+    example: 'active',
     description: 'Trạng thái (active, returned, overdue)',
     enum: ['active', 'returned', 'overdue'],
   })
