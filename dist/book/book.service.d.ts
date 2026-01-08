@@ -1,0 +1,111 @@
+import { PrismaService } from '../prisma/prisma.service';
+import { CreateBookDto } from './dto/create-book.dto';
+import { UpdateBookDto } from './dto/update-book.dto';
+import { BooksQueryDto } from './dto/books-query.dto';
+import { UploadImageService } from '../upload-image/upload-image.service';
+export declare class BookService {
+    private prisma;
+    private uploadImageService;
+    constructor(prisma: PrismaService, uploadImageService: UploadImageService);
+    create(createBookDto: CreateBookDto, coverImageFile?: Express.Multer.File): Promise<{
+        status: string;
+        description: string | null;
+        title: string;
+        id: string;
+        createdAt: Date;
+        author: string;
+        categories: string[];
+        coverImage: string | null;
+        pages: number | null;
+        publicationYear: number | null;
+        publisher: string | null;
+        availableCopies: number;
+        likeCount: number;
+        commentCount: number;
+        borrowCount: number;
+    }>;
+    findAll(query: BooksQueryDto, userId?: string): Promise<{
+        data: {
+            description: string | null;
+            title: string;
+            id: string;
+            createdAt: Date;
+            author: string;
+            categories: string[];
+            coverImage: string | null;
+            pages: number | null;
+            publicationYear: number | null;
+            publisher: string | null;
+            availableCopies: number;
+            likeCount: number;
+            commentCount: number;
+            borrowCount: number;
+        }[];
+        pagination: {
+            page: number;
+            limit: number;
+            total: number;
+            totalPages: number;
+            hasNextPage: boolean;
+            hasPreviousPage: boolean;
+        };
+    }>;
+    findOne(id: string, userId?: string): Promise<{
+        status: string;
+        isBorrowed: boolean;
+        borrowDue: Date | null;
+        isFavorite: boolean;
+        _count: {
+            borrows: number;
+            interactions: number;
+            comments: number;
+        };
+        description: string | null;
+        title: string;
+        id: string;
+        createdAt: Date;
+        author: string;
+        categories: string[];
+        coverImage: string | null;
+        pages: number | null;
+        publicationYear: number | null;
+        publisher: string | null;
+        availableCopies: number;
+        likeCount: number;
+        commentCount: number;
+        borrowCount: number;
+    }>;
+    update(id: string, updateBookDto: UpdateBookDto): Promise<{
+        status: string;
+        description: string | null;
+        title: string;
+        id: string;
+        createdAt: Date;
+        author: string;
+        categories: string[];
+        coverImage: string | null;
+        pages: number | null;
+        publicationYear: number | null;
+        publisher: string | null;
+        availableCopies: number;
+        likeCount: number;
+        commentCount: number;
+        borrowCount: number;
+    }>;
+    remove(id: string): Promise<{
+        description: string | null;
+        title: string;
+        id: string;
+        createdAt: Date;
+        author: string;
+        categories: string[];
+        coverImage: string | null;
+        pages: number | null;
+        publicationYear: number | null;
+        publisher: string | null;
+        availableCopies: number;
+        likeCount: number;
+        commentCount: number;
+        borrowCount: number;
+    }>;
+}
