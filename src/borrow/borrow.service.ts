@@ -1,0 +1,484 @@
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+} from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import { CreateBorrowDto } from './dto/create-borrow.dto';
+import { BorrowsQueryDto } from './dto/borrows-query.dto';
+import { RenewBorrowDto } from './dto/renew-borrow.dto';
+import { BorrowStatus, PointReason, EventType, TicketType, TicketStatus } from '@prisma/client';
+
+@Injectable()
+export class BorrowService {
+  constructor(private prisma: PrismaService) { }
+
+  async create(userId: string, createBorrowDto: CreateBorrowDto) {
+    // Kiểm tra book có tồn tại không
+    const book = await this.prisma.book.findUnique({
+      where: { id: createBorrowDto.bookId },
+    });
+
+    if (!book) {
+      throw new NotFoundException('Sách không tồn tại');
+    }
+
+    // Kiểm tra còn sách có sẵn không
+    if (book.availableCopies <= 0) {
+      throw new BadRequestException('Sách hiện không còn bản sao có sẵn');
+    }
+
+    // Kiểm tra user đã mượn sách này chưa (đang active)
+    const existingBorrow = await this.prisma.borrow.findFirst({
+      where: {
+        userId,
+        bookId: createBorrowDto.bookId,
+        status: BorrowStatus.active,
+      },
+    });
+
+    if (existingBorrow) {
+      throw new BadRequestException('Bạn đang mượn sách này rồi');
+    }
+
+    // Tạo borrow và cập nhật counters trong transaction
+    const result = await this.prisma.$transaction(async (tx) => {
+      // Tạo borrow
+      const borrow = await tx.borrow.create({
+        data: {
+          userId,
+          bookId: createBorrowDto.bookId,
+          dueAt: new Date(createBorrowDto.dueAt),
+        },
+        include: {
+          user: {
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+            },
+          },
+          book: {
+            select: {
+              id: true,
+              title: true,
+              author: true,
+            },
+          },
+        },
+      });
+
+      // Giảm availableCopies
+      await tx.book.update({
+        where: { id: createBorrowDto.bookId },
+        data: {
+          availableCopies: {
+            decrement: 1,
+          },
+          borrowCount: {
+            increment: 1,
+          },
+        },
+      });
+
+      // Cập nhật totalBorrowed của user
+      await tx.user.update({
+        where: { id: userId },
+        data: {
+          totalBorrowed: {
+            increment: 1,
+          },
+        },
+      });
+
+      // Tạo điểm thưởng cho borrow
+      await tx.pointTransaction.create({
+        data: {
+          userId,
+          delta: 10,
+          reason: PointReason.borrow,
+          refType: 'borrow_id',
+          refId: borrow.id,
+          note: 'Mượn sách',
+        },
+      });
+
+      // Tạo activity
+      await tx.activity.create({
+        data: {
+          userId,
+          eventType: EventType.borrow,
+          bookId: createBorrowDto.bookId,
+          payload: {
+            borrowId: borrow.id,
+            dueAt: createBorrowDto.dueAt,
+          },
+        },
+      });
+
+      // Tự động tạo ticket cho yêu cầu mượn sách
+      await tx.ticket.create({
+        data: {
+          userId,
+          type: TicketType.borrow_book,
+          status: TicketStatus.pending,
+          bookId: createBorrowDto.bookId,
+          reason: `Yêu cầu mượn sách: ${book.title}`,
+        },
+      });
+
+      return borrow;
+    });
+
+    return result;
+  }
+
+  async findAll(query: BorrowsQueryDto, userId?: string) {
+    const page = query.page || 1;
+    const limit = query.limit || 10;
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.BorrowWhereInput = {};
+    if (userId) {
+      where.userId = userId;
+    }
+    if (query.status) {
+      where.status = query.status;
+    }
+
+    // Thêm search filter
+    if (query.search) {
+      where.book = {
+        OR: [
+          {
+            title: {
+              contains: query.search,
+              mode: 'insensitive',
+            },
+          },
+          {
+            author: {
+              contains: query.search,
+              mode: 'insensitive',
+            },
+          },
+        ],
+      };
+    }
+
+    const [borrows, total] = await Promise.all([
+      this.prisma.borrow.findMany({
+        where,
+        include: {
+          user: {
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+            },
+          },
+          book: {
+            select: {
+              id: true,
+              title: true,
+              author: true,
+              coverImage: true,
+              availableCopies: true,
+            },
+          },
+        },
+        orderBy: {
+          dueAt: 'asc', // Sắp xếp theo dueAt để hiển thị sách sắp hết hạn trước
+        },
+        skip,
+        take: limit,
+      }),
+      this.prisma.borrow.count({ where }),
+    ]);
+
+    const now = new Date();
+
+    // Thêm các fields tính toán
+    const borrowsWithCalculatedFields = borrows.map((borrow) => {
+      const dueDate = new Date(borrow.dueAt);
+      const daysLeft = Math.ceil(
+        (dueDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24),
+      );
+      const isExpired = daysLeft < 0;
+
+      return {
+        ...borrow,
+        daysLeft,
+        isExpired,
+      };
+    });
+
+    return {
+      data: borrowsWithCalculatedFields,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  async findOne(id: string, userId?: string) {
+    const borrow = await this.prisma.borrow.findUnique({
+      where: { id },
+      include: {
+        user: {
+          select: {
+            id: true,
+            username: true,
+            displayName: true,
+          },
+        },
+        book: {
+          select: {
+            id: true,
+            title: true,
+            author: true,
+          },
+        },
+      },
+    });
+
+    if (!borrow) {
+      throw new NotFoundException('Lịch sử mượn không tồn tại');
+    }
+
+    // Kiểm tra quyền (chỉ owner hoặc admin mới xem được)
+    if (userId && borrow.userId !== userId) {
+      throw new ForbiddenException('Bạn không có quyền xem lịch sử mượn này');
+    }
+
+    return borrow;
+  }
+
+  async returnBook(id: string, userId: string) {
+    const borrow = await this.prisma.borrow.findUnique({
+      where: { id },
+      include: {
+        book: true,
+      },
+    });
+
+    if (!borrow) {
+      throw new NotFoundException('Lịch sử mượn không tồn tại');
+    }
+
+    // Kiểm tra quyền
+    if (borrow.userId !== userId) {
+      throw new ForbiddenException('Bạn không có quyền trả sách này');
+    }
+
+    // Kiểm tra đã trả chưa
+    if (borrow.status === BorrowStatus.returned) {
+      throw new BadRequestException('Sách đã được trả rồi');
+    }
+
+    const now = new Date();
+    const isLate = now > borrow.dueAt;
+
+    // Cập nhật borrow và counters trong transaction
+    const result = await this.prisma.$transaction(async (tx) => {
+      // Cập nhật borrow
+      const updated = await tx.borrow.update({
+        where: { id },
+        data: {
+          status: BorrowStatus.returned,
+          returnedAt: now,
+        },
+        include: {
+          user: {
+            select: {
+              id: true,
+              username: true,
+              displayName: true,
+            },
+          },
+          book: {
+            select: {
+              id: true,
+              title: true,
+              author: true,
+            },
+          },
+        },
+      });
+
+      // Tăng availableCopies
+      await tx.book.update({
+        where: { id: borrow.bookId },
+        data: {
+          availableCopies: {
+            increment: 1,
+          },
+        },
+      });
+
+      // Cập nhật totalReturned của user
+      await tx.user.update({
+        where: { id: userId },
+        data: {
+          totalReturned: {
+            increment: 1,
+          },
+        },
+      });
+
+      // Tạo điểm thưởng (trả đúng hạn: 5 điểm, trả muộn: -5 điểm)
+      const points = isLate ? -5 : 5;
+      await tx.pointTransaction.create({
+        data: {
+          userId,
+          delta: points,
+          reason: isLate ? PointReason.return_late : PointReason.return_on_time,
+          refType: 'borrow_id',
+          refId: borrow.id,
+          note: isLate ? 'Trả sách muộn' : 'Trả sách đúng hạn',
+        },
+      });
+
+      // Tạo activity
+      await tx.activity.create({
+        data: {
+          userId,
+          eventType: EventType.return,
+          bookId: borrow.bookId,
+          payload: {
+            borrowId: borrow.id,
+            isLate,
+          },
+        },
+      });
+
+      // Tự động tạo ticket cho yêu cầu trả sách
+      await tx.ticket.create({
+        data: {
+          userId,
+          type: TicketType.return_book,
+          status: TicketStatus.pending,
+          bookId: borrow.bookId,
+          reason: `Yêu cầu trả sách: ${borrow.book.title}`,
+        },
+      });
+
+      return updated;
+    });
+
+    return result;
+  }
+
+  async renew(id: string, userId: string, renewDto: RenewBorrowDto) {
+    const borrow = await this.prisma.borrow.findUnique({
+      where: { id },
+      include: {
+        book: {
+          select: {
+            id: true,
+            title: true,
+            author: true,
+          },
+        },
+      },
+    });
+
+    if (!borrow) {
+      throw new NotFoundException('Lịch sử mượn không tồn tại');
+    }
+
+    // Kiểm tra quyền
+    if (borrow.userId !== userId) {
+      throw new ForbiddenException('Bạn không có quyền gia hạn sách này');
+    }
+
+    // Kiểm tra đã trả chưa
+    if (borrow.status === BorrowStatus.returned) {
+      throw new BadRequestException('Sách đã được trả rồi, không thể gia hạn');
+    }
+
+    // Kiểm tra đã gia hạn chưa (chỉ được gia hạn 1 lần)
+    if (borrow.renewCount >= borrow.maxRenewCount) {
+      throw new BadRequestException('Bạn đã gia hạn tối đa số lần cho phép');
+    }
+
+    const now = new Date();
+    const currentDueAt = new Date(borrow.dueAt);
+
+    // Tính thời gian còn lại (từ hiện tại đến dueAt)
+    const daysRemaining = Math.ceil(
+      (currentDueAt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24),
+    );
+
+    // Kiểm tra: tổng thời gian (thời gian còn lại + số ngày gia hạn) phải < 30 ngày
+    const totalDays = daysRemaining + renewDto.days;
+    if (totalDays >= 30) {
+      throw new BadRequestException(
+        `Tổng thời gian gia hạn (${daysRemaining} ngày còn lại + ${renewDto.days} ngày gia hạn = ${totalDays} ngày) không được vượt quá 30 ngày`,
+      );
+    }
+
+    // Tính ngày hết hạn mới
+    const newDueAt = new Date(currentDueAt);
+    newDueAt.setDate(newDueAt.getDate() + renewDto.days);
+
+    // Cập nhật borrow
+    const updated = await this.prisma.borrow.update({
+      where: { id },
+      data: {
+        dueAt: newDueAt,
+        renewCount: {
+          increment: 1,
+        },
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            username: true,
+            displayName: true,
+          },
+        },
+        book: {
+          select: {
+            id: true,
+            title: true,
+            author: true,
+          },
+        },
+      },
+    });
+
+    return updated;
+  }
+
+  async remove(id: string, userId: string) {
+    const borrow = await this.prisma.borrow.findUnique({
+      where: { id },
+    });
+
+    if (!borrow) {
+      throw new NotFoundException('Lịch sử mượn không tồn tại');
+    }
+
+    // Kiểm tra quyền
+    if (borrow.userId !== userId) {
+      throw new ForbiddenException('Bạn không có quyền xóa lịch sử mượn này');
+    }
+
+    // Chỉ cho phép xóa nếu đã trả
+    if (borrow.status !== BorrowStatus.returned) {
+      throw new BadRequestException('Chỉ có thể xóa lịch sử mượn đã trả');
+    }
+
+    return this.prisma.borrow.delete({
+      where: { id },
+    });
+  }
+
+}
